@@ -1,3 +1,13 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "numpy",
+#   "torch",
+#   "pillow",
+# ]
+# ///
+
 
 import argparse
 import math
