@@ -11,7 +11,11 @@ uv run neural_hybrid_renderer_minimal.py --steps 10000 --width 128 --height 128 
 
 ## Look!
 
+### Baseline versus Neural
+
 ![baseline_versus_neural](./hybrid_render_out/baseline_vs_neural.gif)
+
+### Target versus Neural
 
 ![target_versus_neural](./hybrid_render_out/target_vs_neural.gif)
 
