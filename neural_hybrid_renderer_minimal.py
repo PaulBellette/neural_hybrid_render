@@ -514,7 +514,7 @@ def make_dataset(
     for _ in range(n_views):
         theta = rng.uniform(theta_min_deg, theta_max_deg)
         radius = rng.uniform(*radius_range)
-        if rng.random() < 0.3:
+        if rng.random() < 0.4:
             cam_height = rng.uniform(2.0, height_range[1])
         else:
             cam_height = rng.uniform(*height_range)
@@ -814,7 +814,7 @@ def main():
     save_image(outdir / "target.png", scene["target_rgb"])
 
     train_data = make_dataset(
-        n_views=96,
+        n_views=192,
         width=args.width,
         height=args.height,
         theta_min_deg=0.0,
