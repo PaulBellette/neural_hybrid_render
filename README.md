@@ -71,7 +71,7 @@ But it also introduced a structural failure:
 That turned out not to be just a training bug. It exposed a real issue with ordinary image-space convolution: nearby pixels in screen space are not always meaningful neighbours in scene space.
 
 ### 3. Partial / mask-aware convolution
-Replacing ordinary convolution with a partial-conv style layer helped a lot.
+Replacing ordinary convolution with a partial-conv style layer helped a lot (but didn't make it go away as you can see in the animations).
 
 That reduced the boundary artifact substantially, which supports the idea that one of the main problems was **invalid-neighbour contamination across visibility boundaries**.
 
@@ -117,8 +117,8 @@ At the moment the script includes:
 
 ## Tone-setting summary
 
-This is not a serious renderer. It is a deliberately tiny experiment that keeps asking a serious question:
+This is not a serious renderer. It is a deliberately tiny experiment that asks a serious question:
 
-> how much of “rendering” is really geometry, and how much is just a learned appearance prior living on top of geometry?
+> how much of “rendering” is really geometry, and how much can we fake it with a learned appearance prior living on top of geometry?
 
 So far the answer seems to be: a lot more can be learned than you might expect, but the moment you do that, the model’s notion of locality becomes the whole game.
