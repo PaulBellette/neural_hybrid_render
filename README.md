@@ -17,7 +17,7 @@ uv run neural_hybrid_renderer_minimal.py --steps 10000 --width 128 --height 128 
 
 ## What this is
 
-This project renders a very small scene — a sphere over a plane — with a movable camera. It first computes a set of geometric buffers in the classical way:
+This project renders a very small scene (a sphere over a plane) with a movable camera. It first computes a set of geometric buffers in the classical way:
 
 - normals
 - depth
@@ -27,7 +27,7 @@ This project renders a very small scene — a sphere over a plane — with a mov
 - view direction
 - world position
 
-Those buffers are then fed into a small neural model which predicts a **stylised residual** on top of the baseline render.
+Those buffers are then fed into a small neural model which predicts a stylised residual on top of the baseline render.
 
 So the rough idea is:
 
@@ -50,7 +50,7 @@ That gives us a toy setting where we can ask useful questions about inductive bi
 ## What we found
 
 ### 1. Per-pixel MLP
-A tiny MLP can learn **local shading logic** surprisingly well:
+A tiny MLP can learn local shading logic surprisingly well:
 - rim light
 - local colour behaviour
 - some object-conditioned effects
@@ -73,12 +73,12 @@ That turned out not to be just a training bug. It exposed a real issue with ordi
 ### 3. Partial / mask-aware convolution
 Replacing ordinary convolution with a partial-conv style layer helped a lot (but didn't make it go away as you can see in the animations).
 
-That reduced the boundary artifact substantially, which supports the idea that one of the main problems was **invalid-neighbour contamination across visibility boundaries**.
+That reduced the boundary artifact substantially, which supports the idea that one of the main problems was invalid-neighbour contamination across visibility boundaries.
 
 ### 4. View distribution matters too
 Some remaining failures came from extreme camera viewpoints, especially high views.
 
-Those were fixed much more by changing the **training distribution** than by adding more hacks to the model. In other words:
+Those were fixed much more by changing the training distribution than by adding more hacks to the model. In other words:
 - some errors were architectural
 - some were just coverage
 
@@ -121,4 +121,4 @@ This is not a serious renderer. It is a deliberately tiny experiment that asks a
 
 > how much of “rendering” is really geometry, and how much can we fake it with a learned appearance prior living on top of geometry?
 
-So far the answer seems to be: a lot more can be learned than you might expect, but the moment you do that, the model’s notion of locality becomes the whole game.
+So far the answer seems to be: a lot more can be learned than you might expect, but the moment you do that, the model’s notion of locality becomes the central problem.
