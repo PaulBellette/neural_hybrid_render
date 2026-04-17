@@ -1,0 +1,11 @@
+# UV / Virtual Environment
+.venv/
+.uv
+
+# hybrid_render_out/
+
+# IDE/Editor (Optional but recommended)
+.vscode/
+.idea/
+
+*.png

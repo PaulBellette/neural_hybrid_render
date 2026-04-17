@@ -738,6 +738,61 @@ def save_dataset_examples(model, dataset, outdir, prefix, device="cpu", residual
 
         save_triptych(outdir / f"{prefix}_{i:03d}.png", base, tgt, pred)
 
+def render_gif_frames(
+    model,
+    width,
+    height,
+    n_frames=48,
+    radius=4.0,
+    height_base=1.8,
+    height_amp=0.5,
+    theta_start_deg=0.0,
+    theta_end_deg=360.0,
+    device="cpu",
+    residual_scale=0.5,
+):
+    baseline_frames = []
+    target_frames = []
+    pred_frames = []
+
+    thetas = np.linspace(theta_start_deg, theta_end_deg, n_frames, endpoint=False)
+
+    for theta in thetas:
+        h = height_base + height_amp * math.sin(math.radians(theta))
+        cam = orbit_camera(theta_deg=float(theta), radius=radius, height=h)
+        scene = build_scene(width=width, height=height, camera=cam)
+
+        pred = render_with_partial_cnn(
+            model,
+            scene["features"],
+            scene["baseline_rgb"],
+            scene["hit_any"],
+            device=device,
+            residual_scale=residual_scale,
+        )
+
+        baseline_frames.append(scene["baseline_rgb"])
+        target_frames.append(scene["target_rgb"])
+        pred_frames.append(pred)
+
+    return baseline_frames, target_frames, pred_frames
+
+def save_gif(path: Path, frames, duration_ms=60, loop=0):
+    pil_frames = [
+        Image.fromarray(np.clip(f * 255.0, 0, 255).astype(np.uint8))
+        for f in frames
+    ]
+    pil_frames[0].save(
+        path,
+        save_all=True,
+        append_images=pil_frames[1:],
+        duration=duration_ms,
+        loop=loop,
+    )
+
+def concat_frames_horiz(frames_a, frames_b):
+    return [np.concatenate([a, b], axis=1) for a, b in zip(frames_a, frames_b)]   
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--width", type=int, default=128)
@@ -757,15 +812,6 @@ def main():
 
     save_image(outdir / "baseline.png", scene["baseline_rgb"])
     save_image(outdir / "target.png", scene["target_rgb"])
-
-    # model, pred = train_on_single_view(
-        # scene["features"],
-        # scene["target_rgb"],
-        # steps=args.steps,
-        # lr=args.lr,
-        # device=args.device,
-        # seed=args.seed,
-    # )
 
     train_data = make_dataset(
         n_views=96,
@@ -818,38 +864,24 @@ def main():
         count=4,
     )
 
-    # model, pred = train_cnn_on_single_view(
-        # scene["features"],
-        # scene["baseline_rgb"],
-        # scene["target_rgb"],
-        # steps=args.steps,
-        # lr=args.lr,
-        # device=args.device,
-        # seed=args.seed,
-    # )
-# 
-    # save_image(outdir / "prediction_train_view.png", pred)
-    # save_triptych(
-        # outdir / "triptych_train_view.png",
-        # scene["baseline_rgb"],
-        # scene["target_rgb"],
-        # pred,
-    # )
+    baseline_frames, target_frames, pred_frames = render_gif_frames(
+        model,
+        width=args.width,
+        height=args.height,
+        n_frames=64,
+        radius=4.0,
+        height_base=1.8,
+        height_amp=0.6,
+        theta_start_deg=0.0,
+        theta_end_deg=360.0,
+        device=args.device,
+        residual_scale=0.5,
+    )
 
-    # A couple of held-out viewpoints
-    # for angle in [10.0, 80.0, 140.0]:
-        # cam = orbit_camera(theta_deg=angle)
-        # test_scene = build_scene(args.width, args.height, camera=cam)
-        #test_pred = render_with_model(model, test_scene["features"], device=args.device)
-        # test_pred = render_with_cnn(model, test_scene["features"], test_scene["baseline_rgb"], device=args.device)
-# 
-        # save_triptych(
-            # outdir / f"triptych_view_{int(angle):03d}.png",
-            # test_scene["baseline_rgb"],
-            # test_scene["target_rgb"],
-            # test_pred,
-        # )
-# 
+    save_gif(outdir / "neural.gif", pred_frames, duration_ms=70)
+    save_gif(outdir / "baseline_vs_neural.gif", concat_frames_horiz(baseline_frames, pred_frames), duration_ms=70)
+    save_gif(outdir / "target_vs_neural.gif", concat_frames_horiz(target_frames, pred_frames))
+    
     print(f"Saved outputs to: {outdir.resolve()}")
     print("Columns in triptych images are: baseline | stylised target | neural prediction")
 
