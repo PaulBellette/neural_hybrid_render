@@ -11,6 +11,8 @@
 
 import argparse
 import math
+import time
+
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -793,6 +795,474 @@ def save_gif(path: Path, frames, duration_ms=60, loop=0):
 def concat_frames_horiz(frames_a, frames_b):
     return [np.concatenate([a, b], axis=1) for a, b in zip(frames_a, frames_b)]   
 
+
+# ------------------------------------------------------------
+# Temporal reprojection validation helpers
+# ------------------------------------------------------------
+
+def extract_delta_cache(
+    delta_rgb: np.ndarray,
+    world_pos: np.ndarray,
+    valid_mask: np.ndarray,
+) -> dict:
+    """
+    Turn a per pixel residual image into a world anchored point cache.
+
+    Parameters
+    ----------
+    delta_rgb : (H, W, 3) float32
+        Residual in RGB space, usually target_rgb - baseline_rgb for frame 0.
+    world_pos : (H, W, 3) float32
+        Per pixel world space hit positions.
+    valid_mask : (H, W) bool or float
+        True where geometry was hit.
+
+    Returns
+    -------
+    cache : dict
+        {
+            "points_world": (N, 3),
+            "delta_rgb": (N, 3),
+        }
+    """
+    valid = valid_mask > 0.5
+    return {
+        "points_world": world_pos[valid].astype(np.float32),
+        "delta_rgb": delta_rgb[valid].astype(np.float32),
+    }
+
+
+def world_to_camera(points_world: np.ndarray, camera: Camera) -> np.ndarray:
+    """
+    Transform world points to camera coordinates.
+    Camera forward is +z in this convention.
+    """
+    forward, right, up = look_at(camera)
+    rel = points_world - camera.eye[None, :]
+    x_cam = rel @ right
+    y_cam = rel @ up
+    z_cam = rel @ forward
+    return np.stack([x_cam, y_cam, z_cam], axis=-1).astype(np.float32)
+
+
+def project_world_points(
+    points_world: np.ndarray,
+    camera: Camera,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Project world points into pixel coordinates for the current camera.
+
+    Returns
+    -------
+    xi : (N,) int32
+        Pixel x indices.
+    yi : (N,) int32
+        Pixel y indices.
+    z_cam : (N,) float32
+        Positive distance along camera forward.
+    in_bounds : (N,) bool
+        True where point is in front of the camera and on screen.
+    """
+    cam_pts = world_to_camera(points_world, camera)
+    x_cam = cam_pts[:, 0]
+    y_cam = cam_pts[:, 1]
+    z_cam = cam_pts[:, 2]
+
+    aspect = width / float(height)
+    fov = math.radians(camera.fov_y_deg)
+    half_h = math.tan(fov / 2.0)
+    half_w = aspect * half_h
+
+    eps = 1e-6
+    in_front = z_cam > eps
+
+    ndc_x = np.full_like(z_cam, np.nan, dtype=np.float32)
+    ndc_y = np.full_like(z_cam, np.nan, dtype=np.float32)
+
+    ndc_x[in_front] = x_cam[in_front] / (z_cam[in_front] * half_w)
+    ndc_y[in_front] = y_cam[in_front] / (z_cam[in_front] * half_h)
+
+    # Inverse of make_rays():
+    # ndc_x = ((x + 0.5) / width) * 2 - 1
+    # ndc_y = 1 - ((y + 0.5) / height) * 2
+    x_pix = ((ndc_x + 1.0) * 0.5) * width - 0.5
+    y_pix = ((1.0 - ndc_y) * 0.5) * height - 0.5
+
+    xi = np.rint(x_pix).astype(np.int32)
+    yi = np.rint(y_pix).astype(np.int32)
+
+    on_screen = (
+        in_front
+        & np.isfinite(x_pix)
+        & np.isfinite(y_pix)
+        & (xi >= 0)
+        & (xi < width)
+        & (yi >= 0)
+        & (yi < height)
+    )
+
+    return xi, yi, z_cam.astype(np.float32), on_screen
+
+
+def rasterize_reprojected_delta(
+    points_world: np.ndarray,
+    delta_rgb: np.ndarray,
+    camera: Camera,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Reproject cached world points into the new camera and z buffer them.
+
+    Returns
+    -------
+    delta_img : (H, W, 3) float32
+        Reprojected delta at winner pixels.
+    zbuf : (H, W) float32
+        Camera space z of the winning reprojection.
+    valid_proj : (H, W) bool
+        True where at least one cached point projects and wins.
+    """
+    delta_img = np.zeros((height, width, 3), dtype=np.float32)
+    zbuf = np.full((height, width), np.inf, dtype=np.float32)
+    valid_proj = np.zeros((height, width), dtype=bool)
+
+    xi, yi, z_cam, on_screen = project_world_points(
+        points_world=points_world,
+        camera=camera,
+        width=width,
+        height=height,
+    )
+
+    idx = np.nonzero(on_screen)[0]
+    if idx.size == 0:
+        return delta_img, zbuf, valid_proj
+
+    # Simple z buffer splat. Closest point wins.
+    for i in idx:
+        x = xi[i]
+        y = yi[i]
+        z = z_cam[i]
+        if z < zbuf[y, x]:
+            zbuf[y, x] = z
+            delta_img[y, x] = delta_rgb[i]
+            valid_proj[y, x] = True
+
+    return delta_img, zbuf, valid_proj
+
+
+def compute_current_camera_depth_from_world_pos(
+    world_pos: np.ndarray,
+    camera: Camera,
+) -> np.ndarray:
+    """
+    Convert per pixel world positions for the current frame into camera space depth.
+    Invalid or background pixels will usually be zero in world_pos, so you should mask them.
+    """
+    h, w, _ = world_pos.shape
+    cam_pts = world_to_camera(world_pos.reshape(-1, 3), camera).reshape(h, w, 3)
+    return cam_pts[..., 2].astype(np.float32)
+
+
+def compute_geom_validity(
+    reproj_zbuf: np.ndarray,
+    current_world_pos: np.ndarray,
+    current_hit_mask: np.ndarray,
+    camera: Camera,
+    depth_eps: float = 0.05,
+) -> np.ndarray:
+    """
+    Reject reprojections that do not agree with the current geometry.
+
+    The comparison is done in camera space z.
+    """
+    current_hit = current_hit_mask > 0.5
+    current_z = compute_current_camera_depth_from_world_pos(current_world_pos, camera)
+
+    valid_geom = np.zeros_like(current_hit, dtype=bool)
+    valid_geom[current_hit] = np.abs(reproj_zbuf[current_hit] - current_z[current_hit]) <= depth_eps
+    return valid_geom
+
+
+def compose_reprojected_frame(
+    baseline_rgb: np.ndarray,
+    delta_reproj: np.ndarray,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Apply the reprojected delta only where valid.
+    """
+    out = baseline_rgb.copy()
+    valid = valid_mask > 0.5
+    out[valid] = np.clip(baseline_rgb[valid] + delta_reproj[valid], 0.0, 1.0)
+    return out.astype(np.float32)
+
+
+def dilate_mask_3x3(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
+    """
+    Tiny numpy only binary dilation for filling one pixel holes.
+    """
+    out = mask.astype(bool).copy()
+    for _ in range(iterations):
+        padded = np.pad(out, ((1, 1), (1, 1)), mode="constant", constant_values=False)
+        nbrs = []
+        for dy in range(3):
+            for dx in range(3):
+                nbrs.append(padded[dy:dy + out.shape[0], dx:dx + out.shape[1]])
+        out = np.logical_or.reduce(nbrs)
+    return out
+
+
+def fill_holes_from_neighbours(
+    delta_img: np.ndarray,
+    valid_mask: np.ndarray,
+    iterations: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Optional cheap post pass to reduce single pixel holes in the reprojection.
+
+    For each invalid pixel adjacent to valid pixels, fill it with the mean of valid
+    8 connected neighbours.
+    """
+    delta = delta_img.copy()
+    valid = valid_mask.astype(bool).copy()
+
+    h, w, c = delta.shape
+    for _ in range(iterations):
+        new_delta = delta.copy()
+        new_valid = valid.copy()
+
+        for y in range(h):
+            y0 = max(0, y - 1)
+            y1 = min(h, y + 2)
+            for x in range(w):
+                if valid[y, x]:
+                    continue
+                x0 = max(0, x - 1)
+                x1 = min(w, x + 2)
+
+                nbr_valid = valid[y0:y1, x0:x1]
+                if not np.any(nbr_valid):
+                    continue
+
+                nbr_delta = delta[y0:y1, x0:x1]
+                vals = nbr_delta[nbr_valid]
+                new_delta[y, x] = np.mean(vals, axis=0)
+                new_valid[y, x] = True
+
+        delta = new_delta
+        valid = new_valid
+
+    return delta.astype(np.float32), valid
+
+
+def render_reprojected_delta_sequence(
+    width: int,
+    height: int,
+    n_frames: int = 64,
+    radius: float = 4.0,
+    height_base: float = 1.8,
+    height_amp: float = 0.6,
+    theta_start_deg: float = 0.0,
+    theta_end_deg: float = 360.0,
+    depth_eps: float = 0.05,
+    hole_fill_iters: int = 0,
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray], list[float]]:
+    """
+    Validation sequence:
+    1. Use frame 0 residual only.
+    2. Reproject that residual to every future camera.
+    3. Compose it with the current baseline.
+    4. Return baseline, target, reprojection result, validity visualisation, and coverage visualisation.
+    """
+    thetas = np.linspace(theta_start_deg, theta_end_deg, n_frames, endpoint=False)
+
+    # Frame 0 cache
+    theta0 = float(thetas[0])
+    h0 = height_base + height_amp * math.sin(math.radians(theta0))
+    cam0 = orbit_camera(theta_deg=theta0, radius=radius, height=h0)
+    scene0 = build_scene(width=width, height=height, camera=cam0)
+
+    # In this repo the last 3 feature channels are world position.
+    world_pos0 = scene0["features"][..., -3:]
+    valid0 = scene0["hit_any"] > 0.5
+    delta0 = scene0["target_rgb"] - scene0["baseline_rgb"]
+
+    cache = extract_delta_cache(
+        delta_rgb=delta0,
+        world_pos=world_pos0,
+        valid_mask=valid0,
+    )
+
+    baseline_frames = []
+    target_frames = []
+    reproj_frames = []
+    valid_vis_frames = []
+    coverage_vis_frames = []
+    reproj_ms_list = []
+
+    for theta in thetas:
+        h = height_base + height_amp * math.sin(math.radians(theta))
+        cam = orbit_camera(theta_deg=float(theta), radius=radius, height=h)
+        scene = build_scene(width=width, height=height, camera=cam)
+
+        current_world_pos = scene["features"][..., -3:]
+        current_hit = scene["hit_any"] > 0.5
+
+        t0 = time.perf_counter()
+
+        delta_reproj, reproj_zbuf, valid_proj = rasterize_reprojected_delta(
+            points_world=cache["points_world"],
+            delta_rgb=cache["delta_rgb"],
+            camera=cam,
+            width=width,
+            height=height,
+        )
+
+        valid_geom = compute_geom_validity(
+            reproj_zbuf=reproj_zbuf,
+            current_world_pos=current_world_pos,
+            current_hit_mask=current_hit,
+            camera=cam,
+            depth_eps=depth_eps,
+        )
+
+        valid_reproj = valid_proj & valid_geom
+
+        if hole_fill_iters > 0:
+            delta_reproj_masked = np.zeros_like(delta_reproj)
+            delta_reproj_masked[valid_reproj] = delta_reproj[valid_reproj]
+            delta_reproj_filled, valid_reproj_filled = fill_holes_from_neighbours(
+                delta_reproj_masked,
+                valid_reproj,
+                iterations=hole_fill_iters,
+            )
+            delta_reproj = delta_reproj_filled
+            valid_reproj = valid_reproj_filled & current_hit
+
+        reproj_img = compose_reprojected_frame(
+            baseline_rgb=scene["baseline_rgb"],
+            delta_reproj=delta_reproj,
+            valid_mask=valid_reproj,
+        )
+
+        t1 = time.perf_counter()
+        reproj_ms_list.append((t1 - t0) * 1000.0)
+
+        coverage = np.zeros((height, width, 3), dtype=np.float32)
+        coverage[..., 1] = valid_reproj.astype(np.float32)  # green valid
+        coverage[..., 0] = (current_hit & ~valid_reproj).astype(np.float32)  # red uncovered geometry
+
+        valid_vis = np.zeros((height, width, 3), dtype=np.float32)
+        valid_vis[..., 1] = valid_proj.astype(np.float32)
+        valid_vis[..., 2] = valid_geom.astype(np.float32)
+
+        baseline_frames.append(scene["baseline_rgb"])
+        target_frames.append(scene["target_rgb"])
+        reproj_frames.append(reproj_img)
+        valid_vis_frames.append(valid_vis)
+        coverage_vis_frames.append(coverage)
+
+    return baseline_frames, target_frames, reproj_frames, valid_vis_frames, coverage_vis_frames, reproj_ms_list
+
+def print_timing_stats(name: str, values_ms: list[float]) -> None:
+    arr = np.asarray(values_ms, dtype=np.float64)
+    print(
+        f"{name}: "
+        f"mean={arr.mean():.3f} ms, "
+        f"median={np.median(arr):.3f} ms, "
+        f"min={arr.min():.3f} ms, "
+        f"max={arr.max():.3f} ms, "
+        f"p95={np.percentile(arr, 95):.3f} ms"
+
+    )
+
+def main_test():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--width", type=int, default=128)
+    parser.add_argument("--height", type=int, default=128)
+    parser.add_argument("--outdir", type=str, default="hybrid_render_out_test")
+    parser.add_argument("--n-frames", type=int, default=64)
+    parser.add_argument("--radius", type=float, default=4.0)
+    parser.add_argument("--height-base", type=float, default=1.8)
+    parser.add_argument("--height-amp", type=float, default=0.6)
+    parser.add_argument("--theta-start-deg", type=float, default=0.0)
+    parser.add_argument("--theta-end-deg", type=float, default=360.0)
+    parser.add_argument("--depth-eps", type=float, default=0.05)
+    parser.add_argument("--hole-fill-iters", type=int, default=0)
+    args = parser.parse_args()
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    (
+        baseline_frames,
+        target_frames,
+        reproj_frames,
+        valid_vis_frames,
+        coverage_vis_frames,
+        reproj_ms_list,
+    ) = render_reprojected_delta_sequence(
+        width=args.width, height=args.height, n_frames=args.n_frames, radius=args.radius,
+        height_base=args.height_base,
+        height_amp=args.height_amp,
+        theta_start_deg=args.theta_start_deg,
+        theta_end_deg=args.theta_end_deg,
+        depth_eps=args.depth_eps,
+        hole_fill_iters=args.hole_fill_iters,
+    )
+
+    # Single frame previews
+    save_image(outdir / "frame0_baseline.png", baseline_frames[0])
+    save_image(outdir / "frame0_target.png", target_frames[0])
+    save_image(outdir / "frame0_reprojected.png", reproj_frames[0])
+    save_triptych(
+        outdir / "frame0_triptych.png",
+        baseline_frames[0],
+        target_frames[0],
+        reproj_frames[0],
+    )
+
+    # GIFs
+    save_gif(outdir / "baseline.gif", baseline_frames, duration_ms=60, loop=0)
+    save_gif(outdir / "target.gif", target_frames, duration_ms=60, loop=0)
+    save_gif(outdir / "reprojected_delta.gif", reproj_frames, duration_ms=60, loop=0)
+    save_gif(outdir / "validity.gif", valid_vis_frames, duration_ms=60, loop=0)
+    save_gif(outdir / "coverage.gif", coverage_vis_frames, duration_ms=60, loop=0)
+
+    # Side by side comparisons
+    save_gif(
+        outdir / "baseline_vs_reprojected.gif",
+        concat_frames_horiz(baseline_frames, reproj_frames),
+        duration_ms=60,
+        loop=0,
+    )
+    save_gif(
+        outdir / "target_vs_reprojected.gif",
+        concat_frames_horiz(target_frames, reproj_frames),
+        duration_ms=60,
+        loop=0,
+    )
+
+    # Simple coverage metric over the whole sequence
+    coverages = []
+    mses = []
+    for target, reproj in zip(target_frames, reproj_frames):
+        # Estimate effective coverage as pixels that differ from baseline composition result
+        # is not directly available here, so use a conservative "non baseline difference" proxy.
+        # Better quantitative metrics can be added later with explicit masks returned.
+        diff = np.mean(np.abs(target - reproj), axis=-1)
+        mses.append(float(np.mean((target - reproj) ** 2)))
+        coverages.append(float(np.mean(diff > 1e-5)))
+
+    print("Saved outputs to:", outdir)
+    print(f"Approx mean frame MSE target vs reprojected: {np.mean(mses):.6f}")
+    print(f"Approx mean changed pixel fraction:        {np.mean(coverages):.6f}")
+    print_timing_stats("reprojection", reproj_ms_list)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--width", type=int, default=128)
@@ -887,4 +1357,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main_test()
