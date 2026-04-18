@@ -1179,7 +1179,695 @@ def print_timing_stats(name: str, values_ms: list[float]) -> None:
 
     )
 
-def main_test():
+# ------------------------------------------------------------
+# Temporal training data generation test
+# ------------------------------------------------------------
+
+CASE_REPROJ = 0
+CASE_NONE = 1
+CASE_CORRUPT = 2
+
+CASE_NAME_TO_ID = {
+    "reproj": CASE_REPROJ,
+    "none": CASE_NONE,
+    "corrupt": CASE_CORRUPT,
+}
+
+CASE_ID_TO_NAME = {v: k for k, v in CASE_NAME_TO_ID.items()}
+
+
+def lerp(a, b, t: float):
+    return (1.0 - t) * a + t * b
+
+
+def make_camera(
+    eye: np.ndarray,
+    target: np.ndarray,
+    up: np.ndarray | None = None,
+    fov_y_deg: float = 45.0,
+) -> Camera:
+    if up is None:
+        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    return Camera(
+        eye=np.asarray(eye, dtype=np.float32),
+        target=np.asarray(target, dtype=np.float32),
+        up=np.asarray(up, dtype=np.float32),
+        fov_y_deg=float(fov_y_deg),
+    )
+
+
+def camera_basis(camera: Camera):
+    forward, right, up = look_at(camera)
+    return forward.astype(np.float32), right.astype(np.float32), up.astype(np.float32)
+
+
+def rotate_vec_around_axis(v: np.ndarray, axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    axis = normalize(axis.astype(np.float32))
+    v = v.astype(np.float32)
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    return (
+        v * c
+        + np.cross(axis, v) * s
+        + axis * np.dot(axis, v) * (1.0 - c)
+    ).astype(np.float32)
+
+
+def perturb_camera_orientation(
+    camera: Camera,
+    yaw_deg: float = 0.0,
+    pitch_deg: float = 0.0,
+    roll_deg: float = 0.0,
+) -> Camera:
+    forward, right, up = camera_basis(camera)
+    f = forward.copy()
+    u = up.copy()
+
+    if abs(yaw_deg) > 1e-9:
+        f = rotate_vec_around_axis(f, u, math.radians(yaw_deg))
+        right = normalize(np.cross(f, u))
+        u = normalize(np.cross(right, f))
+
+    if abs(pitch_deg) > 1e-9:
+        right = normalize(np.cross(f, u))
+        f = rotate_vec_around_axis(f, right, math.radians(pitch_deg))
+        u = normalize(np.cross(right, f))
+
+    if abs(roll_deg) > 1e-9:
+        f = normalize(f)
+        u = rotate_vec_around_axis(u, f, math.radians(roll_deg))
+
+    return make_camera(
+        eye=camera.eye.copy(),
+        target=camera.eye + normalize(f),
+        up=normalize(u),
+        fov_y_deg=camera.fov_y_deg,
+    )
+
+
+def orbit_camera_with_target(
+    theta_deg: float,
+    radius: float = 4.0,
+    height: float = 1.8,
+    target: np.ndarray | None = None,
+    fov_y_deg: float = 45.0,
+) -> Camera:
+    if target is None:
+        target = np.array([0.0, 0.75, 0.0], dtype=np.float32)
+    theta = math.radians(theta_deg)
+    eye = np.array(
+        [
+            radius * math.cos(theta),
+            height,
+            radius * math.sin(theta),
+        ],
+        dtype=np.float32,
+    )
+    return make_camera(eye=eye, target=target, fov_y_deg=fov_y_deg)
+
+
+def sample_camera_path(
+    rng: np.random.Generator,
+    n_frames: int,
+    base_radius: float = 4.0,
+    base_height: float = 1.8,
+    base_fov_y_deg: float = 45.0,
+) -> list[Camera]:
+    """
+    Generates a short smooth camera path from one of several motion families.
+    """
+    mode = rng.choice(
+        ["orbit", "dolly", "truck", "pedestal", "pan", "tilt", "mixed"],
+        p=[0.22, 0.12, 0.14, 0.10, 0.14, 0.12, 0.16],
+    )
+
+    target0 = np.array(
+        [
+            rng.uniform(-0.35, 0.35),
+            rng.uniform(0.55, 0.95),
+            rng.uniform(-0.35, 0.35),
+        ],
+        dtype=np.float32,
+    )
+
+    theta0 = rng.uniform(0.0, 360.0)
+    radius0 = base_radius * rng.uniform(0.85, 1.15)
+    height0 = base_height + rng.uniform(-0.35, 0.35)
+    cam0 = orbit_camera_with_target(
+        theta_deg=theta0,
+        radius=radius0,
+        height=height0,
+        target=target0,
+        fov_y_deg=base_fov_y_deg * rng.uniform(0.9, 1.1),
+    )
+
+    cameras: list[Camera] = []
+    forward0, right0, up0 = camera_basis(cam0)
+
+    if mode == "orbit":
+        dtheta = rng.uniform(-35.0, 35.0)
+        dh = rng.uniform(-0.4, 0.4)
+        dr = rng.uniform(-0.4, 0.4)
+        dtgt = rng.normal(0.0, 0.06, size=(3,)).astype(np.float32)
+        for i in range(n_frames):
+            t = i / max(1, n_frames - 1)
+            cam = orbit_camera_with_target(
+                theta_deg=theta0 + dtheta * t,
+                radius=radius0 + dr * t,
+                height=height0 + dh * t,
+                target=target0 + dtgt * t,
+                fov_y_deg=cam0.fov_y_deg,
+            )
+            cameras.append(cam)
+
+    elif mode == "dolly":
+        d = rng.uniform(-1.0, 1.0)
+        dtarget = rng.normal(0.0, 0.05, size=(3,)).astype(np.float32)
+        for i in range(n_frames):
+            t = i / max(1, n_frames - 1)
+            eye = cam0.eye + forward0 * (d * t)
+            target = cam0.target + dtarget * t
+            cameras.append(make_camera(eye=eye, target=target, up=cam0.up, fov_y_deg=cam0.fov_y_deg))
+
+    elif mode == "truck":
+        d = rng.uniform(-1.0, 1.0)
+        dz = rng.uniform(-0.4, 0.4)
+        for i in range(n_frames):
+            t = i / max(1, n_frames - 1)
+            shift = right0 * (d * t) + forward0 * (0.25 * dz * t)
+            eye = cam0.eye + shift
+            target = cam0.target + shift
+            cameras.append(make_camera(eye=eye, target=target, up=cam0.up, fov_y_deg=cam0.fov_y_deg))
+
+    elif mode == "pedestal":
+        d = rng.uniform(-0.9, 0.9)
+        for i in range(n_frames):
+            t = i / max(1, n_frames - 1)
+            shift = up0 * (d * t)
+            eye = cam0.eye + shift
+            target = cam0.target + shift
+            cameras.append(make_camera(eye=eye, target=target, up=cam0.up, fov_y_deg=cam0.fov_y_deg))
+
+    elif mode == "pan":
+        yaw = rng.uniform(-25.0, 25.0)
+        roll = rng.uniform(-5.0, 5.0)
+        for i in range(n_frames):
+            t = i / max(1, n_frames - 1)
+            cameras.append(
+                perturb_camera_orientation(
+                    cam0,
+                    yaw_deg=yaw * t,
+                    pitch_deg=0.0,
+                    roll_deg=roll * t,
+                )
+            )
+
+    elif mode == "tilt":
+        pitch = rng.uniform(-18.0, 18.0)
+        yaw = rng.uniform(-8.0, 8.0)
+        for i in range(n_frames):
+            t = i / max(1, n_frames - 1)
+            cameras.append(
+                perturb_camera_orientation(
+                    cam0,
+                    yaw_deg=yaw * t,
+                    pitch_deg=pitch * t,
+                    roll_deg=0.0,
+                )
+            )
+
+    else:
+        dtheta = rng.uniform(-25.0, 25.0)
+        dr = rng.uniform(-0.6, 0.6)
+        dh = rng.uniform(-0.45, 0.45)
+        yaw = rng.uniform(-14.0, 14.0)
+        pitch = rng.uniform(-12.0, 12.0)
+        shift_r = rng.uniform(-0.45, 0.45)
+        shift_u = rng.uniform(-0.35, 0.35)
+        dtgt = rng.normal(0.0, 0.05, size=(3,)).astype(np.float32)
+        for i in range(n_frames):
+            t = i / max(1, n_frames - 1)
+            cam = orbit_camera_with_target(
+                theta_deg=theta0 + dtheta * t,
+                radius=radius0 + dr * t,
+                height=height0 + dh * t,
+                target=target0 + dtgt * t,
+                fov_y_deg=cam0.fov_y_deg,
+            )
+            f, r, u = camera_basis(cam)
+            shift = r * (shift_r * t) + u * (shift_u * t)
+            cam = make_camera(
+                eye=cam.eye + shift,
+                target=cam.target + shift,
+                up=cam.up,
+                fov_y_deg=cam.fov_y_deg,
+            )
+            cam = perturb_camera_orientation(cam, yaw_deg=yaw * t, pitch_deg=pitch * t, roll_deg=0.0)
+            cameras.append(cam)
+
+    return cameras
+
+
+def render_scene_frame(width: int, height: int, camera: Camera) -> dict:
+    """
+    Wrapper around build_scene that pulls out the fields we need for temporal samples.
+    Assumes the last 3 feature channels are world position.
+    """
+    scene = build_scene(width=width, height=height, camera=camera)
+
+    features = scene["features"].astype(np.float32)
+    baseline_rgb = scene["baseline_rgb"].astype(np.float32)
+    target_rgb = scene["target_rgb"].astype(np.float32)
+    hit_any = scene["hit_any"].astype(np.float32)
+
+    world_pos = features[..., -3:].astype(np.float32)
+    delta_rgb = (target_rgb - baseline_rgb).astype(np.float32)
+
+    out = {
+        "camera": camera,
+        "features": features,
+        "world_pos": world_pos,
+        "baseline_rgb": baseline_rgb,
+        "target_rgb": target_rgb,
+        "delta_rgb": delta_rgb,
+        "hit_any": hit_any,
+    }
+
+    if "normal" in scene:
+        out["normal"] = scene["normal"].astype(np.float32)
+
+    return out
+
+
+def masked_zero_like_hw3(height: int, width: int) -> np.ndarray:
+    return np.zeros((height, width, 3), dtype=np.float32)
+
+
+def masked_zero_like_hw(height: int, width: int) -> np.ndarray:
+    return np.zeros((height, width), dtype=np.float32)
+
+
+def random_binary_keep_mask(
+    rng: np.random.Generator,
+    height: int,
+    width: int,
+    keep_prob: float,
+) -> np.ndarray:
+    return (rng.random((height, width)) < keep_prob).astype(np.float32)
+
+
+def shift_image_integer(
+    img: np.ndarray,
+    dx: int,
+    dy: int,
+    fill_value: float = 0.0,
+) -> np.ndarray:
+    out = np.full_like(img, fill_value)
+    h, w = img.shape[:2]
+
+    x_src0 = max(0, -dx)
+    x_src1 = min(w, w - dx)
+    y_src0 = max(0, -dy)
+    y_src1 = min(h, h - dy)
+
+    x_dst0 = max(0, dx)
+    x_dst1 = min(w, w + dx)
+    y_dst0 = max(0, dy)
+    y_dst1 = min(h, h + dy)
+
+    out[y_dst0:y_dst1, x_dst0:x_dst1] = img[y_src0:y_src1, x_src0:x_src1]
+    return out
+
+
+def blur3x3_mean(img: np.ndarray) -> np.ndarray:
+    padded = np.pad(img, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    acc = np.zeros_like(img)
+    for dy in range(3):
+        for dx in range(3):
+            acc += padded[dy:dy + img.shape[0], dx:dx + img.shape[1]]
+    return acc / 9.0
+
+
+def erode_mask3x3(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
+    out = (mask > 0.5)
+    for _ in range(iterations):
+        padded = np.pad(out, ((1, 1), (1, 1)), mode="constant", constant_values=False)
+        nbrs = []
+        for dy in range(3):
+            for dx in range(3):
+                nbrs.append(padded[dy:dy + out.shape[0], dx:dx + out.shape[1]])
+        out = np.logical_and.reduce(nbrs)
+    return out.astype(np.float32)
+
+
+def corrupt_reprojected_inputs(
+    rng: np.random.Generator,
+    delta_reproj: np.ndarray,
+    valid_reproj: np.ndarray,
+    current_hit: np.ndarray,
+    noise_std: float = 0.03,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Corrupts a real reprojection so the network cannot simply trust the mask.
+    """
+    h, w, _ = delta_reproj.shape
+
+    delta = delta_reproj.copy()
+    valid = valid_reproj.astype(np.float32).copy()
+
+    # Random integer shift
+    if rng.random() < 0.8:
+        dx = int(rng.integers(-2, 3))
+        dy = int(rng.integers(-2, 3))
+        delta = shift_image_integer(delta, dx=dx, dy=dy, fill_value=0.0)
+        valid = shift_image_integer(valid[..., None], dx=dx, dy=dy, fill_value=0.0)[..., 0]
+
+    # Random mask dropout
+    if rng.random() < 0.9:
+        keep_prob = float(rng.uniform(0.75, 0.97))
+        keep = random_binary_keep_mask(rng, h, w, keep_prob)
+        valid *= keep
+        delta *= valid[..., None]
+
+    # Erode mask a little
+    if rng.random() < 0.6:
+        iters = int(rng.integers(1, 3))
+        valid = erode_mask3x3(valid, iterations=iters)
+        delta *= valid[..., None]
+
+    # Local blur to smear details slightly
+    if rng.random() < 0.5:
+        delta = blur3x3_mean(delta)
+
+    # Add bounded noise where still valid
+    if rng.random() < 0.85:
+        noise = rng.normal(0.0, noise_std, size=delta.shape).astype(np.float32)
+        delta = delta + noise * valid[..., None]
+
+    # Optionally invert a small fraction of valid pixels into invalid and vice versa
+    if rng.random() < 0.4:
+        flip = random_binary_keep_mask(rng, h, w, keep_prob=float(rng.uniform(0.97, 0.995)))
+        valid = np.where(flip > 0.5, 1.0 - valid, valid).astype(np.float32)
+
+    # Do not let corrupted mask extend outside currently hit geometry too much
+    valid *= (current_hit > 0.5).astype(np.float32)
+    delta *= valid[..., None]
+
+    delta = np.clip(delta, -1.0, 1.0).astype(np.float32)
+    return delta, valid.astype(np.float32)
+
+
+def choose_temporal_case(
+    rng: np.random.Generator,
+    p_reproj: float,
+    p_none: float,
+    p_corrupt: float,
+) -> str:
+    probs = np.array([p_reproj, p_none, p_corrupt], dtype=np.float64)
+    probs = probs / probs.sum()
+    case_id = int(rng.choice(3, p=probs))
+    return CASE_ID_TO_NAME[case_id]
+
+
+def make_temporal_training_sample(
+    rng: np.random.Generator,
+    prev_frame: dict | None,
+    curr_frame: dict,
+    width: int,
+    height: int,
+    depth_eps: float,
+    case_name: str,
+) -> dict:
+    """
+    Builds one training sample for the current frame using:
+    real reprojection, no reprojection, or corrupted reprojection.
+    """
+    features_curr = curr_frame["features"]
+    current_hit = curr_frame["hit_any"]
+    target_delta = curr_frame["delta_rgb"]
+    baseline_rgb = curr_frame["baseline_rgb"]
+    target_rgb = curr_frame["target_rgb"]
+
+    delta_reproj = masked_zero_like_hw3(height, width)
+    valid_reproj = masked_zero_like_hw(height, width)
+
+    if prev_frame is not None:
+        cache = extract_delta_cache(
+            delta_rgb=prev_frame["delta_rgb"],
+            world_pos=prev_frame["world_pos"],
+            valid_mask=prev_frame["hit_any"] > 0.5,
+        )
+
+        delta_real, reproj_zbuf, valid_proj = rasterize_reprojected_delta(
+            points_world=cache["points_world"],
+            delta_rgb=cache["delta_rgb"],
+            camera=curr_frame["camera"],
+            width=width,
+            height=height,
+        )
+
+        valid_geom = compute_geom_validity(
+            reproj_zbuf=reproj_zbuf,
+            current_world_pos=curr_frame["world_pos"],
+            current_hit_mask=current_hit > 0.5,
+            camera=curr_frame["camera"],
+            depth_eps=depth_eps,
+        )
+
+        valid_real = (valid_proj & valid_geom).astype(np.float32)
+        delta_real *= valid_real[..., None]
+
+        if case_name == "reproj":
+            delta_reproj = delta_real
+            valid_reproj = valid_real
+
+        elif case_name == "none":
+            delta_reproj = masked_zero_like_hw3(height, width)
+            valid_reproj = masked_zero_like_hw(height, width)
+
+        elif case_name == "corrupt":
+            delta_reproj, valid_reproj = corrupt_reprojected_inputs(
+                rng=rng,
+                delta_reproj=delta_real,
+                valid_reproj=valid_real,
+                current_hit=current_hit,
+            )
+
+        else:
+            raise ValueError(f"Unknown case_name: {case_name}")
+
+    else:
+        # First frame in a path has no previous frame by construction
+        delta_reproj = masked_zero_like_hw3(height, width)
+        valid_reproj = masked_zero_like_hw(height, width)
+        case_name = "none"
+
+    preview_rgb = compose_reprojected_frame(
+        baseline_rgb=baseline_rgb,
+        delta_reproj=delta_reproj,
+        valid_mask=valid_reproj > 0.5,
+    )
+
+    return {
+        "features_curr": features_curr.astype(np.float32),
+        "delta_reproj": delta_reproj.astype(np.float32),
+        "valid_reproj": valid_reproj.astype(np.float32),
+        "target_delta": target_delta.astype(np.float32),
+        "baseline_rgb": baseline_rgb.astype(np.float32),
+        "target_rgb": target_rgb.astype(np.float32),
+        "preview_rgb": preview_rgb.astype(np.float32),
+        "curr_hit": current_hit.astype(np.float32),
+        "case_id": np.int32(CASE_NAME_TO_ID[case_name]),
+    }
+
+
+def save_temporal_dataset_npz(
+    out_path: Path,
+    samples: list[dict],
+) -> None:
+    features_curr = np.stack([s["features_curr"] for s in samples], axis=0)
+    delta_reproj = np.stack([s["delta_reproj"] for s in samples], axis=0)
+    valid_reproj = np.stack([s["valid_reproj"] for s in samples], axis=0)
+    target_delta = np.stack([s["target_delta"] for s in samples], axis=0)
+    baseline_rgb = np.stack([s["baseline_rgb"] for s in samples], axis=0)
+    target_rgb = np.stack([s["target_rgb"] for s in samples], axis=0)
+    preview_rgb = np.stack([s["preview_rgb"] for s in samples], axis=0)
+    curr_hit = np.stack([s["curr_hit"] for s in samples], axis=0)
+    case_id = np.asarray([s["case_id"] for s in samples], dtype=np.int32)
+
+    np.savez_compressed(
+        out_path,
+        features_curr=features_curr,
+        delta_reproj=delta_reproj,
+        valid_reproj=valid_reproj,
+        target_delta=target_delta,
+        baseline_rgb=baseline_rgb,
+        target_rgb=target_rgb,
+        preview_rgb=preview_rgb,
+        curr_hit=curr_hit,
+        case_id=case_id,
+    )
+
+
+def save_temporal_preview_grid(
+    outdir: Path,
+    samples: list[dict],
+    max_items: int = 24,
+) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    n = min(max_items, len(samples))
+    if n == 0:
+        return
+
+    for i in range(n):
+        s = samples[i]
+        valid_rgb = np.zeros_like(s["baseline_rgb"])
+        valid_rgb[..., 1] = s["valid_reproj"]
+
+        save_triptych(
+            outdir / f"sample_{i:04d}_{CASE_ID_TO_NAME[int(s['case_id'])]}.png",
+            s["baseline_rgb"],
+            s["target_rgb"],
+            s["preview_rgb"],
+        )
+        save_image(outdir / f"sample_{i:04d}_valid.png", valid_rgb)
+        # Visualise the reprojected delta around zero
+        delta_vis = np.clip(0.5 + 0.5 * s["delta_reproj"], 0.0, 1.0)
+        save_image(outdir / f"sample_{i:04d}_delta_reproj.png", delta_vis)
+
+
+def render_path_preview_gif(
+    out_path: Path,
+    path_frames: list[dict],
+) -> None:
+    frames = []
+    for s in path_frames:
+        case_name = CASE_ID_TO_NAME[int(s["case_id"])]
+        valid_rgb = np.zeros_like(s["baseline_rgb"])
+        valid_rgb[..., 1] = s["valid_reproj"]
+        row = concat_frames_horiz(
+            [s["baseline_rgb"], s["target_rgb"], s["preview_rgb"], valid_rgb]
+        )
+        frames.append(row)
+    save_gif(out_path, frames, duration_ms=80, loop=0)
+
+
+def concat_frames_horiz(frames: list[np.ndarray]) -> list[np.ndarray] | np.ndarray:
+    """
+    Overload tolerant helper:
+    if given a list of per image arrays, return one concatenated frame.
+    if existing project helper already exists with a different signature, rename this.
+    """
+    if len(frames) == 0:
+        raise ValueError("No frames to concatenate")
+    return np.concatenate(frames, axis=1)
+
+
+def main_training_gen_test():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--width", type=int, default=128)
+    parser.add_argument("--height", type=int, default=128)
+    parser.add_argument("--outdir", type=str, default="hybrid_render_training_gen_test")
+    parser.add_argument("--num-paths", type=int, default=40)
+    parser.add_argument("--frames-per-path", type=int, default=6)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--depth-eps", type=float, default=0.05)
+
+    parser.add_argument("--p-reproj", type=float, default=0.60)
+    parser.add_argument("--p-none", type=float, default=0.20)
+    parser.add_argument("--p-corrupt", type=float, default=0.20)
+
+    parser.add_argument("--preview-items", type=int, default=24)
+    parser.add_argument("--preview-path-gifs", type=int, default=8)
+    args = parser.parse_args()
+
+    rng = np.random.default_rng(args.seed)
+
+    width = int(args.width)
+    height = int(args.height)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    samples: list[dict] = []
+    preview_path_samples: list[list[dict]] = []
+
+    case_counts = {
+        "reproj": 0,
+        "none": 0,
+        "corrupt": 0,
+    }
+
+    for path_idx in range(args.num_paths):
+        cameras = sample_camera_path(
+            rng=rng,
+            n_frames=args.frames_per_path,
+            base_radius=4.0,
+            base_height=1.8,
+            base_fov_y_deg=45.0,
+        )
+
+        rendered = [render_scene_frame(width=width, height=height, camera=cam) for cam in cameras]
+
+        path_samples: list[dict] = []
+        prev_frame = None
+
+        for frame_idx, curr_frame in enumerate(rendered):
+            if prev_frame is None:
+                case_name = "none"
+            else:
+                case_name = choose_temporal_case(
+                    rng=rng,
+                    p_reproj=args.p_reproj,
+                    p_none=args.p_none,
+                    p_corrupt=args.p_corrupt,
+                )
+
+            sample = make_temporal_training_sample(
+                rng=rng,
+                prev_frame=prev_frame,
+                curr_frame=curr_frame,
+                width=width,
+                height=height,
+                depth_eps=float(args.depth_eps),
+                case_name=case_name,
+            )
+
+            case_counts[CASE_ID_TO_NAME[int(sample["case_id"])]] += 1
+            samples.append(sample)
+            path_samples.append(sample)
+
+            prev_frame = curr_frame
+
+        preview_path_samples.append(path_samples)
+
+    save_temporal_dataset_npz(outdir / "temporal_training_samples.npz", samples)
+    save_temporal_preview_grid(outdir / "preview_samples", samples, max_items=args.preview_items)
+
+    gif_count = min(args.preview_path_gifs, len(preview_path_samples))
+    gif_dir = outdir / "preview_path_gifs"
+    gif_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(gif_count):
+        render_path_preview_gif(
+            gif_dir / f"path_{i:03d}.gif",
+            preview_path_samples[i],
+        )
+
+    num_samples = len(samples)
+    print("Saved:", outdir / "temporal_training_samples.npz")
+    print("Total samples:", num_samples)
+    for k in ["reproj", "none", "corrupt"]:
+        frac = case_counts[k] / max(1, num_samples)
+        print(f"{k:8s} count={case_counts[k]:6d} frac={frac:.3f}")
+
+    # Basic sanity checks
+    valid_means = np.asarray([np.mean(s["valid_reproj"]) for s in samples], dtype=np.float64)
+    delta_mags = np.asarray([np.mean(np.abs(s["delta_reproj"])) for s in samples], dtype=np.float64)
+    print(f"mean(valid_reproj) = {valid_means.mean():.4f}")
+    print(f"mean(abs(delta_reproj)) = {delta_mags.mean():.4f}")
+
+
+def main_delta_reprojection_test():
     parser = argparse.ArgumentParser()
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--height", type=int, default=128)
@@ -1357,4 +2045,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main_test()
+    main_training_gen_test()
