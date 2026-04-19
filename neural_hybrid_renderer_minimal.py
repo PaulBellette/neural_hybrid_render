@@ -1286,148 +1286,6 @@ def orbit_camera_with_target(
     return make_camera(eye=eye, target=target, fov_y_deg=fov_y_deg)
 
 
-def sample_camera_path(
-    rng: np.random.Generator,
-    n_frames: int,
-    base_radius: float = 4.0,
-    base_height: float = 1.8,
-    base_fov_y_deg: float = 45.0,
-) -> list[Camera]:
-    """
-    Generates a short smooth camera path from one of several motion families.
-    """
-    mode = rng.choice(
-        ["orbit", "dolly", "truck", "pedestal", "pan", "tilt", "mixed"],
-        p=[0.22, 0.12, 0.14, 0.10, 0.14, 0.12, 0.16],
-    )
-
-    target0 = np.array(
-        [
-            rng.uniform(-0.35, 0.35),
-            rng.uniform(0.55, 0.95),
-            rng.uniform(-0.35, 0.35),
-        ],
-        dtype=np.float32,
-    )
-
-    theta0 = rng.uniform(0.0, 360.0)
-    radius0 = base_radius * rng.uniform(0.85, 1.15)
-    height0 = base_height + rng.uniform(-0.35, 0.35)
-    cam0 = orbit_camera_with_target(
-        theta_deg=theta0,
-        radius=radius0,
-        height=height0,
-        target=target0,
-        fov_y_deg=base_fov_y_deg * rng.uniform(0.9, 1.1),
-    )
-
-    cameras: list[Camera] = []
-    forward0, right0, up0 = camera_basis(cam0)
-
-    if mode == "orbit":
-        dtheta = rng.uniform(-35.0, 35.0)
-        dh = rng.uniform(-0.4, 0.4)
-        dr = rng.uniform(-0.4, 0.4)
-        dtgt = rng.normal(0.0, 0.06, size=(3,)).astype(np.float32)
-        for i in range(n_frames):
-            t = i / max(1, n_frames - 1)
-            cam = orbit_camera_with_target(
-                theta_deg=theta0 + dtheta * t,
-                radius=radius0 + dr * t,
-                height=height0 + dh * t,
-                target=target0 + dtgt * t,
-                fov_y_deg=cam0.fov_y_deg,
-            )
-            cameras.append(cam)
-
-    elif mode == "dolly":
-        d = rng.uniform(-1.0, 1.0)
-        dtarget = rng.normal(0.0, 0.05, size=(3,)).astype(np.float32)
-        for i in range(n_frames):
-            t = i / max(1, n_frames - 1)
-            eye = cam0.eye + forward0 * (d * t)
-            target = cam0.target + dtarget * t
-            cameras.append(make_camera(eye=eye, target=target, up=cam0.up, fov_y_deg=cam0.fov_y_deg))
-
-    elif mode == "truck":
-        d = rng.uniform(-1.0, 1.0)
-        dz = rng.uniform(-0.4, 0.4)
-        for i in range(n_frames):
-            t = i / max(1, n_frames - 1)
-            shift = right0 * (d * t) + forward0 * (0.25 * dz * t)
-            eye = cam0.eye + shift
-            target = cam0.target + shift
-            cameras.append(make_camera(eye=eye, target=target, up=cam0.up, fov_y_deg=cam0.fov_y_deg))
-
-    elif mode == "pedestal":
-        d = rng.uniform(-0.9, 0.9)
-        for i in range(n_frames):
-            t = i / max(1, n_frames - 1)
-            shift = up0 * (d * t)
-            eye = cam0.eye + shift
-            target = cam0.target + shift
-            cameras.append(make_camera(eye=eye, target=target, up=cam0.up, fov_y_deg=cam0.fov_y_deg))
-
-    elif mode == "pan":
-        yaw = rng.uniform(-25.0, 25.0)
-        roll = rng.uniform(-5.0, 5.0)
-        for i in range(n_frames):
-            t = i / max(1, n_frames - 1)
-            cameras.append(
-                perturb_camera_orientation(
-                    cam0,
-                    yaw_deg=yaw * t,
-                    pitch_deg=0.0,
-                    roll_deg=roll * t,
-                )
-            )
-
-    elif mode == "tilt":
-        pitch = rng.uniform(-18.0, 18.0)
-        yaw = rng.uniform(-8.0, 8.0)
-        for i in range(n_frames):
-            t = i / max(1, n_frames - 1)
-            cameras.append(
-                perturb_camera_orientation(
-                    cam0,
-                    yaw_deg=yaw * t,
-                    pitch_deg=pitch * t,
-                    roll_deg=0.0,
-                )
-            )
-
-    else:
-        dtheta = rng.uniform(-25.0, 25.0)
-        dr = rng.uniform(-0.6, 0.6)
-        dh = rng.uniform(-0.45, 0.45)
-        yaw = rng.uniform(-14.0, 14.0)
-        pitch = rng.uniform(-12.0, 12.0)
-        shift_r = rng.uniform(-0.45, 0.45)
-        shift_u = rng.uniform(-0.35, 0.35)
-        dtgt = rng.normal(0.0, 0.05, size=(3,)).astype(np.float32)
-        for i in range(n_frames):
-            t = i / max(1, n_frames - 1)
-            cam = orbit_camera_with_target(
-                theta_deg=theta0 + dtheta * t,
-                radius=radius0 + dr * t,
-                height=height0 + dh * t,
-                target=target0 + dtgt * t,
-                fov_y_deg=cam0.fov_y_deg,
-            )
-            f, r, u = camera_basis(cam)
-            shift = r * (shift_r * t) + u * (shift_u * t)
-            cam = make_camera(
-                eye=cam.eye + shift,
-                target=cam.target + shift,
-                up=cam.up,
-                fov_y_deg=cam.fov_y_deg,
-            )
-            cam = perturb_camera_orientation(cam, yaw_deg=yaw * t, pitch_deg=pitch * t, roll_deg=0.0)
-            cameras.append(cam)
-
-    return cameras
-
-
 def render_scene_frame(width: int, height: int, camera: Camera) -> dict:
     """
     Wrapper around build_scene that pulls out the fields we need for temporal samples.
@@ -1763,14 +1621,297 @@ def concat_frames_horiz(frames: list[np.ndarray]) -> list[np.ndarray] | np.ndarr
         raise ValueError("No frames to concatenate")
     return np.concatenate(frames, axis=1)
 
+# ------------------------------------------------------------
+# Broader camera start distribution plus local path generation
+# ------------------------------------------------------------
+
+def sample_base_camera(
+    rng: np.random.Generator,
+    base_radius: float = 4.0,
+    base_height: float = 1.8,
+    base_fov_y_deg: float = 45.0,
+) -> Camera:
+    """
+    Sample a broad starting camera.
+
+    Mixture of:
+    1. Canonical anchor views with jitter
+    2. Broad random views
+    3. More extreme but still useful views
+    """
+    mode = rng.choice(
+        ["anchor", "broad", "extreme"],
+        p=[0.50, 0.35, 0.15],
+    )
+
+    target = np.array(
+        [
+            rng.uniform(-0.45, 0.45),
+            rng.uniform(0.45, 1.05),
+            rng.uniform(-0.45, 0.45),
+        ],
+        dtype=np.float32,
+    )
+
+    if mode == "anchor":
+        # Canonical azimuth anchors around the object, similar spirit to original training coverage
+        anchor_thetas = np.array(
+            [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0],
+            dtype=np.float32,
+        )
+        theta = float(rng.choice(anchor_thetas) + rng.uniform(-18.0, 18.0))
+        radius = float(base_radius * rng.uniform(0.82, 1.18))
+        height = float(base_height + rng.uniform(-0.55, 0.55))
+        fov = float(base_fov_y_deg * rng.uniform(0.90, 1.12))
+
+    elif mode == "broad":
+        theta = float(rng.uniform(0.0, 360.0))
+        radius = float(base_radius * rng.uniform(0.65, 1.45))
+        height = float(base_height + rng.uniform(-1.00, 1.00))
+        fov = float(base_fov_y_deg * rng.uniform(0.82, 1.22))
+
+    else:
+        # Deliberately include some harder starts
+        theta = float(rng.uniform(0.0, 360.0))
+
+        extreme_kind = rng.choice(
+            ["close_low", "close_high", "far_low", "far_high", "grazing"],
+            p=[0.22, 0.18, 0.20, 0.18, 0.22],
+        )
+
+        if extreme_kind == "close_low":
+            radius = float(base_radius * rng.uniform(0.55, 0.80))
+            height = float(base_height + rng.uniform(-1.10, -0.30))
+        elif extreme_kind == "close_high":
+            radius = float(base_radius * rng.uniform(0.55, 0.85))
+            height = float(base_height + rng.uniform(0.55, 1.35))
+        elif extreme_kind == "far_low":
+            radius = float(base_radius * rng.uniform(1.20, 1.70))
+            height = float(base_height + rng.uniform(-0.95, -0.10))
+        elif extreme_kind == "far_high":
+            radius = float(base_radius * rng.uniform(1.20, 1.75))
+            height = float(base_height + rng.uniform(0.50, 1.55))
+        else:
+            radius = float(base_radius * rng.uniform(0.70, 1.35))
+            height = float(base_height + rng.uniform(-1.20, -0.65))
+
+        fov = float(base_fov_y_deg * rng.uniform(0.85, 1.18))
+
+    cam = orbit_camera_with_target(
+        theta_deg=theta,
+        radius=radius,
+        height=height,
+        target=target,
+        fov_y_deg=fov,
+    )
+
+    # Add a small base orientation perturbation so starting views are not too rigid
+    cam = perturb_camera_orientation(
+        cam,
+        yaw_deg=float(rng.uniform(-10.0, 10.0)),
+        pitch_deg=float(rng.uniform(-8.0, 8.0)),
+        roll_deg=float(rng.uniform(-4.0, 4.0)),
+    )
+
+    return cam
+
+
+def sample_camera_path_from_base(
+    rng: np.random.Generator,
+    base_camera: Camera,
+    n_frames: int,
+) -> list[Camera]:
+    """
+    Generate a short smooth path starting from a broad base camera.
+    """
+    mode = rng.choice(
+        ["orbit", "dolly", "truck", "pedestal", "pan", "tilt", "mixed"],
+        p=[0.20, 0.12, 0.14, 0.10, 0.14, 0.12, 0.18],
+    )
+
+    cameras: list[Camera] = [base_camera]
+    f0, r0, u0 = camera_basis(base_camera)
+
+    if n_frames <= 1:
+        return cameras
+
+    if mode == "orbit":
+        # Orbit around the current target, preserving the spirit of a local fly around
+        rel = base_camera.eye - base_camera.target
+        radius0 = float(np.linalg.norm(rel[[0, 2]]))
+        theta0 = math.degrees(math.atan2(rel[2], rel[0]))
+        height0 = float(base_camera.eye[1])
+
+        dtheta = rng.uniform(-40.0, 40.0)
+        dr = rng.uniform(-0.45, 0.45)
+        dh = rng.uniform(-0.45, 0.45)
+        dtgt = rng.normal(0.0, 0.05, size=(3,)).astype(np.float32)
+
+        for i in range(1, n_frames):
+            t = i / (n_frames - 1)
+            cam = orbit_camera_with_target(
+                theta_deg=theta0 + dtheta * t,
+                radius=max(0.4, radius0 + dr * t),
+                height=height0 + dh * t,
+                target=base_camera.target + dtgt * t,
+                fov_y_deg=base_camera.fov_y_deg,
+            )
+            cam = perturb_camera_orientation(
+                cam,
+                yaw_deg=float(rng.uniform(-3.0, 3.0) * t),
+                pitch_deg=float(rng.uniform(-3.0, 3.0) * t),
+                roll_deg=float(rng.uniform(-1.0, 1.0) * t),
+            )
+            cameras.append(cam)
+
+    elif mode == "dolly":
+        d = rng.uniform(-1.20, 1.20)
+        dtarget = rng.normal(0.0, 0.04, size=(3,)).astype(np.float32)
+
+        for i in range(1, n_frames):
+            t = i / (n_frames - 1)
+            eye = base_camera.eye + f0 * (d * t)
+            target = base_camera.target + dtarget * t
+            cam = make_camera(
+                eye=eye,
+                target=target,
+                up=base_camera.up,
+                fov_y_deg=base_camera.fov_y_deg,
+            )
+            cameras.append(cam)
+
+    elif mode == "truck":
+        d = rng.uniform(-1.20, 1.20)
+        d2 = rng.uniform(-0.35, 0.35)
+
+        for i in range(1, n_frames):
+            t = i / (n_frames - 1)
+            shift = r0 * (d * t) + f0 * (d2 * t)
+            cam = make_camera(
+                eye=base_camera.eye + shift,
+                target=base_camera.target + shift,
+                up=base_camera.up,
+                fov_y_deg=base_camera.fov_y_deg,
+            )
+            cameras.append(cam)
+
+    elif mode == "pedestal":
+        d = rng.uniform(-1.00, 1.00)
+
+        for i in range(1, n_frames):
+            t = i / (n_frames - 1)
+            shift = u0 * (d * t)
+            cam = make_camera(
+                eye=base_camera.eye + shift,
+                target=base_camera.target + shift,
+                up=base_camera.up,
+                fov_y_deg=base_camera.fov_y_deg,
+            )
+            cameras.append(cam)
+
+    elif mode == "pan":
+        yaw = rng.uniform(-28.0, 28.0)
+        roll = rng.uniform(-5.0, 5.0)
+
+        for i in range(1, n_frames):
+            t = i / (n_frames - 1)
+            cam = perturb_camera_orientation(
+                base_camera,
+                yaw_deg=yaw * t,
+                pitch_deg=0.0,
+                roll_deg=roll * t,
+            )
+            cameras.append(cam)
+
+    elif mode == "tilt":
+        pitch = rng.uniform(-20.0, 20.0)
+        yaw = rng.uniform(-8.0, 8.0)
+
+        for i in range(1, n_frames):
+            t = i / (n_frames - 1)
+            cam = perturb_camera_orientation(
+                base_camera,
+                yaw_deg=yaw * t,
+                pitch_deg=pitch * t,
+                roll_deg=0.0,
+            )
+            cameras.append(cam)
+
+    else:
+        # Mixed motion tends to look most like real camera motion
+        rel = base_camera.eye - base_camera.target
+        radius0 = float(np.linalg.norm(rel[[0, 2]]))
+        theta0 = math.degrees(math.atan2(rel[2], rel[0]))
+        height0 = float(base_camera.eye[1])
+
+        dtheta = rng.uniform(-26.0, 26.0)
+        dr = rng.uniform(-0.55, 0.55)
+        dh = rng.uniform(-0.55, 0.55)
+        shift_r = rng.uniform(-0.55, 0.55)
+        shift_u = rng.uniform(-0.40, 0.40)
+        yaw = rng.uniform(-16.0, 16.0)
+        pitch = rng.uniform(-12.0, 12.0)
+        dtgt = rng.normal(0.0, 0.05, size=(3,)).astype(np.float32)
+
+        for i in range(1, n_frames):
+            t = i / (n_frames - 1)
+            cam = orbit_camera_with_target(
+                theta_deg=theta0 + dtheta * t,
+                radius=max(0.4, radius0 + dr * t),
+                height=height0 + dh * t,
+                target=base_camera.target + dtgt * t,
+                fov_y_deg=base_camera.fov_y_deg,
+            )
+            _, rr, uu = camera_basis(cam)
+            shift = rr * (shift_r * t) + uu * (shift_u * t)
+            cam = make_camera(
+                eye=cam.eye + shift,
+                target=cam.target + shift,
+                up=cam.up,
+                fov_y_deg=cam.fov_y_deg,
+            )
+            cam = perturb_camera_orientation(
+                cam,
+                yaw_deg=yaw * t,
+                pitch_deg=pitch * t,
+                roll_deg=0.0,
+            )
+            cameras.append(cam)
+
+    return cameras
+
+
+def sample_camera_path(
+    rng: np.random.Generator,
+    n_frames: int,
+    base_radius: float = 4.0,
+    base_height: float = 1.8,
+    base_fov_y_deg: float = 45.0,
+) -> list[Camera]:
+    """
+    Backwards compatible wrapper.
+    """
+    base_cam = sample_base_camera(
+        rng=rng,
+        base_radius=base_radius,
+        base_height=base_height,
+        base_fov_y_deg=base_fov_y_deg,
+    )
+    return sample_camera_path_from_base(
+        rng=rng,
+        base_camera=base_cam,
+        n_frames=n_frames,
+    )
 
 def main_training_gen_test():
     parser = argparse.ArgumentParser()
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--height", type=int, default=128)
     parser.add_argument("--outdir", type=str, default="hybrid_render_training_gen_test")
-    parser.add_argument("--num-paths", type=int, default=40)
-    parser.add_argument("--frames-per-path", type=int, default=6)
+    parser.add_argument("--num-paths", type=int, default=120)
+    parser.add_argument("--frames-per-path", type=int, default=8)
+    parser.add_argument("--preview-items", type=int, default=36)
+    parser.add_argument("--preview-path-gifs", type=int, default=12)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--depth-eps", type=float, default=0.05)
 
@@ -1778,8 +1919,6 @@ def main_training_gen_test():
     parser.add_argument("--p-none", type=float, default=0.20)
     parser.add_argument("--p-corrupt", type=float, default=0.20)
 
-    parser.add_argument("--preview-items", type=int, default=24)
-    parser.add_argument("--preview-path-gifs", type=int, default=8)
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
