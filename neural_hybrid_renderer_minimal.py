@@ -12,8 +12,10 @@
 import argparse
 import math
 import time
+import random
 
 from dataclasses import dataclass
+
 from pathlib import Path
 
 import numpy as np
@@ -1903,6 +1905,653 @@ def sample_camera_path(
         n_frames=n_frames,
     )
 
+# ------------------------------------------------------------
+# Temporal training dataset + simple temporal model
+# ------------------------------------------------------------
+
+
+@dataclass
+class TemporalBatch:
+    x: torch.Tensor
+    y: torch.Tensor
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def to_nchw(x: np.ndarray) -> np.ndarray:
+    """
+    NHWC -> NCHW
+    """
+    return np.transpose(x, (0, 3, 1, 2))
+
+
+def hwc_to_chw(x: np.ndarray) -> np.ndarray:
+    """
+    HWC -> CHW
+    """
+    return np.transpose(x, (2, 0, 1))
+
+
+class TemporalNpzDataset(torch.utils.data.Dataset):
+    """
+    Reads temporal training samples from the generated npz file.
+
+    Inputs:
+        features_curr : (N, H, W, F)
+        delta_reproj  : (N, H, W, 3)
+        valid_reproj  : (N, H, W)
+    Target:
+        target_delta  : (N, H, W, 3)
+
+    Final network input:
+        concat(features_curr, delta_reproj, valid_reproj[..., None], axis=-1)
+    """
+
+    def __init__(
+        self,
+        npz_path: str | Path,
+        indices: np.ndarray | None = None,
+        include_case_id_onehot: bool = False,
+    ):
+        data = np.load(npz_path)
+
+        self.features_curr = data["features_curr"].astype(np.float32)
+        self.delta_reproj = data["delta_reproj"].astype(np.float32)
+        self.valid_reproj = data["valid_reproj"].astype(np.float32)
+        self.target_delta = data["target_delta"].astype(np.float32)
+
+        self.case_id = None
+        if "case_id" in data:
+            self.case_id = data["case_id"].astype(np.int64)
+
+        if indices is None:
+            self.indices = np.arange(len(self.features_curr), dtype=np.int64)
+        else:
+            self.indices = np.asarray(indices, dtype=np.int64)
+
+        self.include_case_id_onehot = include_case_id_onehot
+
+        feat_ch = self.features_curr.shape[-1]
+        extra_ch = 3 + 1
+        if self.include_case_id_onehot and self.case_id is not None:
+            extra_ch += 3
+
+        self.input_channels = feat_ch + extra_ch
+        self.target_channels = self.target_delta.shape[-1]
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def _build_input_hwc(self, i: int) -> np.ndarray:
+        feat = self.features_curr[i]
+        delta = self.delta_reproj[i]
+        valid = self.valid_reproj[i][..., None]
+
+        xs = [feat, delta, valid]
+
+        if self.include_case_id_onehot and self.case_id is not None:
+            case = self.case_id[i]
+            h, w, _ = feat.shape
+            onehot = np.zeros((h, w, 3), dtype=np.float32)
+            onehot[..., case] = 1.0
+            xs.append(onehot)
+
+        x = np.concatenate(xs, axis=-1).astype(np.float32)
+        return x
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        i = int(self.indices[idx])
+
+        x = self._build_input_hwc(i)
+        y = self.target_delta[i]
+
+        x = torch.from_numpy(hwc_to_chw(x))
+        y = torch.from_numpy(hwc_to_chw(y))
+        return x, y
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class TemporalResidualCNN(nn.Module):
+    """
+    Predicts current delta from temporal inputs.
+
+    No fancy temporal branch yet.
+    Just a direct CNN over:
+        current features
+        reprojected previous delta
+        valid reprojection mask
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int = 64,
+        depth: int = 4,
+        out_channels: int = 3,
+    ):
+        super().__init__()
+
+        layers: list[nn.Module] = []
+        c_in = in_channels
+        for _ in range(depth):
+            layers.append(ConvBlock(c_in, hidden_channels))
+            c_in = hidden_channels
+
+        self.body = nn.Sequential(*layers)
+        self.head = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.body(x)
+        y = self.head(h)
+        return y
+
+
+def split_indices(
+    n: int,
+    train_frac: float = 0.9,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    idx = np.arange(n, dtype=np.int64)
+    rng.shuffle(idx)
+    n_train = int(round(train_frac * n))
+    n_train = max(1, min(n - 1, n_train))
+    train_idx = idx[:n_train]
+    val_idx = idx[n_train:]
+    return train_idx, val_idx
+
+
+def make_temporal_dataloaders(
+    npz_path: str | Path,
+    batch_size: int = 16,
+    train_frac: float = 0.9,
+    seed: int = 0,
+    include_case_id_onehot: bool = False,
+) -> tuple[TemporalNpzDataset, TemporalNpzDataset, torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    data = np.load(npz_path)
+    n = len(data["features_curr"])
+    train_idx, val_idx = split_indices(n=n, train_frac=train_frac, seed=seed)
+
+    ds_train = TemporalNpzDataset(
+        npz_path=npz_path,
+        indices=train_idx,
+        include_case_id_onehot=include_case_id_onehot,
+    )
+    ds_val = TemporalNpzDataset(
+        npz_path=npz_path,
+        indices=val_idx,
+        include_case_id_onehot=include_case_id_onehot,
+    )
+
+    dl_train = torch.utils.data.DataLoader(
+        ds_train,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        drop_last=False,
+    )
+    dl_val = torch.utils.data.DataLoader(
+        ds_val,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        drop_last=False,
+    )
+
+    return ds_train, ds_val, dl_train, dl_val
+
+
+def masked_l1_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    pred, target: (N, C, H, W)
+    mask: (N, 1, H, W) or None
+    """
+    err = torch.abs(pred - target)
+    if mask is None:
+        return err.mean()
+
+    err = err * mask
+    denom = mask.sum() * pred.shape[1]
+    denom = torch.clamp(denom, min=1.0)
+    return err.sum() / denom
+
+
+@torch.no_grad()
+def evaluate_temporal_model(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> dict:
+    model.eval()
+    losses = []
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        pred = model(x)
+        loss = masked_l1_loss(pred, y)
+        losses.append(float(loss.item()))
+
+    arr = np.asarray(losses, dtype=np.float64)
+    return {
+        "loss_mean": float(arr.mean()) if len(arr) else float("nan"),
+    }
+
+
+def save_tensor_image(path: Path, chw: torch.Tensor) -> None:
+    """
+    Saves CHW image in range [0,1].
+    """
+    x = chw.detach().cpu().numpy()
+    x = np.transpose(x, (1, 2, 0))
+    x = np.clip(x, 0.0, 1.0)
+    img = (255.0 * x).astype(np.uint8)
+    Image.fromarray(img).save(path)
+
+
+@torch.no_grad()
+def save_temporal_validation_previews(
+    model: nn.Module,
+    dataset: TemporalNpzDataset,
+    outdir: Path,
+    device: torch.device,
+    num_items: int = 12,
+) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+    model.eval()
+
+    n = min(num_items, len(dataset))
+    for i in range(n):
+        x, y = dataset[i]
+        pred = model(x[None].to(device))[0].cpu()
+
+        # Recover useful visualisations from input tensor
+        c_feat = dataset.features_curr.shape[-1]
+        x_np = x.numpy()
+        delta_reproj = x_np[c_feat:c_feat + 3]
+        valid_reproj = x_np[c_feat + 3:c_feat + 4]
+
+        # Visualise deltas around zero
+        delta_reproj_vis = np.clip(0.5 + 0.5 * np.transpose(delta_reproj, (1, 2, 0)), 0.0, 1.0)
+        pred_vis = np.clip(0.5 + 0.5 * np.transpose(pred.numpy(), (1, 2, 0)), 0.0, 1.0)
+        target_vis = np.clip(0.5 + 0.5 * np.transpose(y.numpy(), (1, 2, 0)), 0.0, 1.0)
+
+        valid_vis = np.zeros_like(delta_reproj_vis)
+        valid_vis[..., 1] = valid_reproj[0]
+
+        Image.fromarray((255.0 * delta_reproj_vis).astype(np.uint8)).save(outdir / f"{i:04d}_delta_reproj.png")
+        Image.fromarray((255.0 * valid_vis).astype(np.uint8)).save(outdir / f"{i:04d}_valid_reproj.png")
+        Image.fromarray((255.0 * pred_vis).astype(np.uint8)).save(outdir / f"{i:04d}_pred_delta.png")
+        Image.fromarray((255.0 * target_vis).astype(np.uint8)).save(outdir / f"{i:04d}_target_delta.png")
+
+
+def load_temporal_model_checkpoint(
+    ckpt_path: str | Path,
+    in_channels: int,
+    out_channels: int = 3,
+    device: torch.device = torch.device("cpu"),
+) -> nn.Module:
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    model = TemporalResidualCNN(
+        in_channels=in_channels,
+        hidden_channels=ckpt["hidden_channels"],
+        depth=ckpt["depth"],
+        out_channels=out_channels,
+    ).to(device)
+
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model
+
+
+def train_temporal_model(
+    npz_path: str | Path,
+    outdir: str | Path,
+    batch_size: int = 16,
+    epochs: int = 40,
+    lr: float = 1e-3,
+    train_frac: float = 0.9,
+    seed: int = 0,
+    hidden_channels: int = 64,
+    depth: int = 4,
+    include_case_id_onehot: bool = False,
+    device: torch.device = torch.device("cpu"),
+    ) -> tuple[nn.Module, torch.device, int]:
+    set_seed(seed)
+
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+
+    ds_train, ds_val, dl_train, dl_val = make_temporal_dataloaders(
+        npz_path=npz_path,
+        batch_size=batch_size,
+        train_frac=train_frac,
+        seed=seed,
+        include_case_id_onehot=include_case_id_onehot,
+    )
+
+    model = TemporalResidualCNN(
+        in_channels=ds_train.input_channels,
+        hidden_channels=hidden_channels,
+        depth=depth,
+        out_channels=ds_train.target_channels,
+    ).to(device)
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    best_val = float("inf")
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+    }
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_losses = []
+
+        for x, y in dl_train:
+            x = x.to(device)
+            y = y.to(device)
+
+            pred = model(x)
+            loss = masked_l1_loss(pred, y)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            train_losses.append(float(loss.item()))
+
+        train_loss = float(np.mean(train_losses))
+        val_stats = evaluate_temporal_model(model, dl_val, device=device)
+        val_loss = val_stats["loss_mean"]
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+
+        print(
+            f"epoch {epoch:03d}  "
+            f"train_l1={train_loss:.6f}  "
+            f"val_l1={val_loss:.6f}"
+        )
+
+        latest_ckpt = {
+            "model_state_dict": model.state_dict(),
+            "input_channels": ds_train.input_channels,
+            "hidden_channels": hidden_channels,
+            "depth": depth,
+        }
+        torch.save(latest_ckpt, outdir / "model_latest.pt")
+
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(latest_ckpt, outdir / "model_best.pt")
+            save_temporal_validation_previews(
+                model=model,
+                dataset=ds_val,
+                outdir=outdir / "val_previews_best",
+                device=device,
+                num_items=12,
+            )
+
+    np.savez_compressed(
+        outdir / "training_history.npz",
+        train_loss=np.asarray(history["train_loss"], dtype=np.float32),
+        val_loss=np.asarray(history["val_loss"], dtype=np.float32),
+    )
+
+    print("Saved outputs to:", outdir)
+    print("Best val L1:", best_val)
+
+    return model, device, ds_train.input_channels
+
+
+@torch.no_grad()
+def render_temporal_orbit_gif(
+    model: nn.Module,
+    width: int,
+    height: int,
+    out_path: Path,
+    n_frames: int = 64,
+    radius: float = 4.0,
+    height_base: float = 1.8,
+    height_amp: float = 0.6,
+    device: torch.device = torch.device("cpu"),
+    depth_eps: float = 0.05,
+    include_case_id_onehot: bool = False,
+    default_case_name: str = "reproj",
+):
+    model.eval()
+
+    thetas = np.linspace(0.0, 360.0, n_frames, endpoint=False)
+
+    prev_delta = None
+    prev_world = None
+    prev_valid = None
+
+    frames = []
+
+    for i, theta in enumerate(thetas):
+        h = height_base + height_amp * math.sin(math.radians(theta))
+        cam = orbit_camera(theta_deg=float(theta), radius=radius, height=h)
+        scene = build_scene(width=width, height=height, camera=cam)
+
+        features = scene["features"].astype(np.float32)
+        baseline = scene["baseline_rgb"].astype(np.float32)
+        world_pos = features[..., -3:]
+        hit = scene["hit_any"] > 0.5
+
+        if prev_delta is None:
+            delta_reproj = np.zeros((height, width, 3), dtype=np.float32)
+            valid_reproj = np.zeros((height, width), dtype=np.float32)
+            case_name = "none"
+        else:
+            cache = extract_delta_cache(
+                delta_rgb=prev_delta,
+                world_pos=prev_world,
+                valid_mask=prev_valid,
+            )
+
+            delta_r, zbuf, valid_proj = rasterize_reprojected_delta(
+                points_world=cache["points_world"],
+                delta_rgb=cache["delta_rgb"],
+                camera=cam,
+                width=width,
+                height=height,
+            )
+
+            valid_geom = compute_geom_validity(
+                reproj_zbuf=zbuf,
+                current_world_pos=world_pos,
+                current_hit_mask=hit,
+                camera=cam,
+                depth_eps=depth_eps,
+            )
+
+            valid_reproj = (valid_proj & valid_geom).astype(np.float32)
+            delta_reproj = delta_r * valid_reproj[..., None]
+            case_name = default_case_name
+
+        xs = [
+            features,
+            delta_reproj,
+            valid_reproj[..., None],
+        ]
+
+        if include_case_id_onehot:
+            onehot = np.zeros((height, width, 3), dtype=np.float32)
+            onehot[..., CASE_NAME_TO_ID[case_name]] = 1.0
+            xs.append(onehot)
+
+        x = np.concatenate(xs, axis=-1).astype(np.float32)
+
+        x_t = torch.from_numpy(hwc_to_chw(x))[None].to(device)
+
+        pred_delta = model(x_t)[0].cpu().numpy()
+        pred_delta = np.transpose(pred_delta, (1, 2, 0))
+
+        pred_rgb = np.clip(baseline + pred_delta, 0.0, 1.0)
+        frames.append(pred_rgb)
+
+        prev_delta = pred_delta
+        prev_world = world_pos
+        prev_valid = hit.astype(np.float32)
+
+    save_gif(out_path, frames, duration_ms=60, loop=0)
+
+
+def infer_temporal_input_channels(
+    npz_path: str | Path,
+    include_case_id_onehot: bool = False,
+) -> int:
+    """
+    Infer the temporal model input channel count from the dataset layout.
+
+    Input is:
+        features_curr
+        + delta_reproj (3)
+        + valid_reproj (1)
+        + optional case_id onehot (3)
+
+    Returns
+    -------
+    int
+        Number of model input channels.
+    """
+    data = np.load(npz_path)
+    feat_ch = int(data["features_curr"].shape[-1])
+
+    extra_ch = 3 + 1
+    if include_case_id_onehot:
+        if "case_id" not in data:
+            raise ValueError(
+                "include_case_id_onehot=True but case_id is not present in the npz dataset."
+            )
+        extra_ch += 3
+
+    return feat_ch + extra_ch
+
+
+def main_training_temporal():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--npz",
+        type=str,
+        help="Path to temporal_training_samples.npz",
+        default="hybrid_render_temporal_training_samples.npz",
+    )
+    parser.add_argument(
+        "--outdir",
+        type=str,
+        default="hybrid_render_temporal_train",
+    )
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--train-frac", type=float, default=0.9)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--hidden-channels", type=int, default=64)
+    parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument(
+        "--include-case-id-onehot",
+        action="store_true",
+        help="Optionally include case id as extra one hot channels",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help="cpu | cuda | auto",
+    )
+    parser.add_argument(
+        "--skip-train",
+        action="store_true",
+        help="Skip training and just render with best checkpoint",
+    )
+    args = parser.parse_args()
+
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+
+    print("using device:", device)
+
+    if not args.skip_train:
+        model, device, input_channels = train_temporal_model(
+            npz_path=args.npz,
+            outdir=args.outdir,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            train_frac=args.train_frac,
+            seed=args.seed,
+            hidden_channels=args.hidden_channels,
+            depth=args.depth,
+            include_case_id_onehot=args.include_case_id_onehot,
+            device=device,
+        )
+    else:
+        input_channels = infer_temporal_input_channels(
+            npz_path=args.npz,
+            include_case_id_onehot=args.include_case_id_onehot,
+        )
+        print("skip training enabled")
+        print("inferred input_channels from dataset:", input_channels)
+
+    ckpt_path = Path(args.outdir) / "model_best.pt"
+    ckpt_meta = torch.load(ckpt_path, map_location="cpu")
+
+    if "input_channels" in ckpt_meta:
+        ckpt_in_channels = int(ckpt_meta["input_channels"])
+        print("checkpoint input_channels:", ckpt_in_channels)
+        if ckpt_in_channels != input_channels:
+            raise ValueError(
+                f"Input channel mismatch: dataset/config expects {input_channels}, "
+                f"but checkpoint was trained with {ckpt_in_channels}."
+            )
+
+    best_model = load_temporal_model_checkpoint(
+        ckpt_path=ckpt_path,
+        in_channels=input_channels,
+        out_channels=3,
+        device=device,
+    )
+
+    render_temporal_orbit_gif(
+        model=best_model,
+        width=128,
+        height=128,
+        out_path=Path(args.outdir) / "temporal_orbit.gif",
+        device=device,
+        include_case_id_onehot=args.include_case_id_onehot,
+    )
+
+
 def main_training_gen_test():
     parser = argparse.ArgumentParser()
     parser.add_argument("--width", type=int, default=128)
@@ -2184,4 +2833,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main_training_gen_test()
+    main_training_temporal()
