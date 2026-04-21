@@ -2557,8 +2557,8 @@ def main_training_gen_test():
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--height", type=int, default=128)
     parser.add_argument("--outdir", type=str, default="hybrid_render_training_gen_test")
-    parser.add_argument("--num-paths", type=int, default=120)
-    parser.add_argument("--frames-per-path", type=int, default=8)
+    parser.add_argument("--num-paths", type=int, default=960)
+    parser.add_argument("--frames-per-path", type=int, default=2)
     parser.add_argument("--preview-items", type=int, default=36)
     parser.add_argument("--preview-path-gifs", type=int, default=12)
     parser.add_argument("--seed", type=int, default=0)
@@ -2653,90 +2653,6 @@ def main_training_gen_test():
     delta_mags = np.asarray([np.mean(np.abs(s["delta_reproj"])) for s in samples], dtype=np.float64)
     print(f"mean(valid_reproj) = {valid_means.mean():.4f}")
     print(f"mean(abs(delta_reproj)) = {delta_mags.mean():.4f}")
-
-
-def main_delta_reprojection_test():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--width", type=int, default=128)
-    parser.add_argument("--height", type=int, default=128)
-    parser.add_argument("--outdir", type=str, default="hybrid_render_out_test")
-    parser.add_argument("--n-frames", type=int, default=64)
-    parser.add_argument("--radius", type=float, default=4.0)
-    parser.add_argument("--height-base", type=float, default=1.8)
-    parser.add_argument("--height-amp", type=float, default=0.6)
-    parser.add_argument("--theta-start-deg", type=float, default=0.0)
-    parser.add_argument("--theta-end-deg", type=float, default=360.0)
-    parser.add_argument("--depth-eps", type=float, default=0.05)
-    parser.add_argument("--hole-fill-iters", type=int, default=0)
-    args = parser.parse_args()
-
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    (
-        baseline_frames,
-        target_frames,
-        reproj_frames,
-        valid_vis_frames,
-        coverage_vis_frames,
-        reproj_ms_list,
-    ) = render_reprojected_delta_sequence(
-        width=args.width, height=args.height, n_frames=args.n_frames, radius=args.radius,
-        height_base=args.height_base,
-        height_amp=args.height_amp,
-        theta_start_deg=args.theta_start_deg,
-        theta_end_deg=args.theta_end_deg,
-        depth_eps=args.depth_eps,
-        hole_fill_iters=args.hole_fill_iters,
-    )
-
-    # Single frame previews
-    save_image(outdir / "frame0_baseline.png", baseline_frames[0])
-    save_image(outdir / "frame0_target.png", target_frames[0])
-    save_image(outdir / "frame0_reprojected.png", reproj_frames[0])
-    save_triptych(
-        outdir / "frame0_triptych.png",
-        baseline_frames[0],
-        target_frames[0],
-        reproj_frames[0],
-    )
-
-    # GIFs
-    save_gif(outdir / "baseline.gif", baseline_frames, duration_ms=60, loop=0)
-    save_gif(outdir / "target.gif", target_frames, duration_ms=60, loop=0)
-    save_gif(outdir / "reprojected_delta.gif", reproj_frames, duration_ms=60, loop=0)
-    save_gif(outdir / "validity.gif", valid_vis_frames, duration_ms=60, loop=0)
-    save_gif(outdir / "coverage.gif", coverage_vis_frames, duration_ms=60, loop=0)
-
-    # Side by side comparisons
-    save_gif(
-        outdir / "baseline_vs_reprojected.gif",
-        concat_frames_horiz(baseline_frames, reproj_frames),
-        duration_ms=60,
-        loop=0,
-    )
-    save_gif(
-        outdir / "target_vs_reprojected.gif",
-        concat_frames_horiz(target_frames, reproj_frames),
-        duration_ms=60,
-        loop=0,
-    )
-
-    # Simple coverage metric over the whole sequence
-    coverages = []
-    mses = []
-    for target, reproj in zip(target_frames, reproj_frames):
-        # Estimate effective coverage as pixels that differ from baseline composition result
-        # is not directly available here, so use a conservative "non baseline difference" proxy.
-        # Better quantitative metrics can be added later with explicit masks returned.
-        diff = np.mean(np.abs(target - reproj), axis=-1)
-        mses.append(float(np.mean((target - reproj) ** 2)))
-        coverages.append(float(np.mean(diff > 1e-5)))
-
-    print("Saved outputs to:", outdir)
-    print(f"Approx mean frame MSE target vs reprojected: {np.mean(mses):.6f}")
-    print(f"Approx mean changed pixel fraction:        {np.mean(coverages):.6f}")
-    print_timing_stats("reprojection", reproj_ms_list)
 
 
 def main():
